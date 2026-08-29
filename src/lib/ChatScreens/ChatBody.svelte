@@ -196,35 +196,34 @@
                 }
             })
             const exactAssets = new Map(normalizedAssets.map((asset) => [asset.name, asset.path]))
+            const resolvedAssetPaths = new Map<string, string | null>()
+            const fileSrcPromises = new Map<string, Promise<string>>()
 
-            imgs.forEach(async (img) => {
-                const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
-
-                if(
-                    name.length > 200 ||
-                    name.includes(':')
-                ){
-                    img.setAttribute('noimage', 'true')
-                    return
+            const getFileSrcOnce = (path: string) => {
+                let pending = fileSrcPromises.get(path)
+                if(!pending){
+                    pending = getFileSrc(path)
+                    fileSrcPromises.set(path, pending)
                 }
-                
-                const foundAsset = exactAssets.get(name)
-                if(foundAsset){
-                    const got = await getFileSrc(foundAsset)
-                    const currentName = img.getAttribute('src')?.toLocaleLowerCase() || ''
-                    if(name !== currentName){
-                        return
-                    }
-                    img.classList.add('root-loaded-image')
-                    img.classList.add('root-loaded-image-' + styl)
-                    img.src = got
-                    return
+                return pending
+            }
+
+            const findAssetPath = (name: string) => {
+                if(resolvedAssetPaths.has(name)){
+                    return resolvedAssetPaths.get(name) ?? null
+                }
+
+                const exact = exactAssets.get(name)
+                if(exact){
+                    resolvedAssetPaths.set(name, exact)
+                    return exact
                 }
 
                 if(name.length < 3){
-                    img.setAttribute('noimage', 'true')
-                    return
+                    resolvedAssetPaths.set(name, null)
+                    return null
                 }
+
                 const prefixLoc = name.lastIndexOf('.')
                 const prefix = prefixLoc > 0 ? name.substring(0, prefixLoc) : ''
                 let currentDistance = 1000
@@ -242,19 +241,39 @@
                         currentFound = asset.path
                     }
                 }
-                if(currentFound){
-                    const got = await getFileSrc(currentFound)
-                    const name2 = img.getAttribute('src')?.toLocaleLowerCase() || ''
-                    if(name === name2){
-                        img.setAttribute('src', got)
-                        img.classList.add('root-loaded-image')
-                        img.classList.add('root-loaded-image-' + styl)
-                        img.removeAttribute('noimage')
-                    }
-                }
-                else{
+
+                const resolved = currentFound || null
+                resolvedAssetPaths.set(name, resolved)
+                return resolved
+            }
+
+            imgs.forEach(async (img) => {
+                const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
+
+                if(
+                    name.length > 200 ||
+                    name.includes(':')
+                ){
                     img.setAttribute('noimage', 'true')
+                    return
                 }
+
+                const foundAsset = findAssetPath(name)
+                if(!foundAsset){
+                    img.setAttribute('noimage', 'true')
+                    return
+                }
+
+                const got = await getFileSrcOnce(foundAsset)
+                const currentName = img.getAttribute('src')?.toLocaleLowerCase() || ''
+                if(name !== currentName){
+                    return
+                }
+
+                img.setAttribute('src', got)
+                img.classList.add('root-loaded-image')
+                img.classList.add('root-loaded-image-' + styl)
+                img.removeAttribute('noimage')
             })
         }
     }
