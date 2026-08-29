@@ -45,7 +45,7 @@
 
     // svelte-ignore non_reactive_update
     let lastParsed = ''
-    let lastCharArg:string|simpleCharacterArgument|null = null
+    let lastCharArg:string|simpleCharacterArgument = null
     let lastChatId = -10
     let lastRenderedRevision: number | null = null
 
@@ -67,7 +67,7 @@
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
-    const markParsing = async (data: string, charArg: string | simpleCharacterArgument | null, chatID: number, requestedRevision: number, tries?:number) => {
+    const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, requestedRevision: number, tries?:number) => {
         // track 'translated' and 'retranslate' state
         translated;
         retranslate;
@@ -254,7 +254,7 @@
         }
     }
 
-    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character, idx, renderRevision))
+    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character ?? '', idx, renderRevision))
 
     $effect(() => {
         if(shouldRenderRawStreaming){
