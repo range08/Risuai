@@ -1,5 +1,6 @@
 <script lang="ts">
     import isEqual from "lodash/isEqual"
+    import { tick } from "svelte"
     import { DBState } from 'src/ts/stores.svelte'
     import { sleep } from "src/ts/util"
     import { alertError } from "../../ts/alert"
@@ -30,7 +31,7 @@
         character = null,
         idx = 0,
         firstMessage = false,
-        msgDisplay,
+        msgDisplay = '',
         role,
         translated = $bindable(false),
         translating = $bindable(false),
@@ -44,7 +45,7 @@
 
     // svelte-ignore non_reactive_update
     let lastParsed = ''
-    let lastCharArg:string|simpleCharacterArgument = null
+    let lastCharArg:string|simpleCharacterArgument|null = null
     let lastChatId = -10
     let lastRenderedRevision: number | null = null
 
@@ -66,7 +67,7 @@
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
-    const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, requestedRevision: number, tries?:number) => {
+    const markParsing = async (data: string, charArg: string | simpleCharacterArgument | null, chatID: number, requestedRevision: number, tries?:number) => {
         // track 'translated' and 'retranslate' state
         translated;
         retranslate;
@@ -198,7 +199,6 @@
 
             imgs.forEach(async (img) => {
                 const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
-                console.log(name)
 
                 if(
                     name.length > 200 ||
@@ -209,7 +209,6 @@
                 }
                 
                 const foundAsset = exactAssets.get(name)
-                console.log('Checking image:', name, 'Assets:', assets)
                 if(foundAsset){
                     img.classList.add('root-loaded-image')
                     img.classList.add('root-loaded-image-' + styl)
@@ -261,9 +260,20 @@
         if(shouldRenderRawStreaming){
             return
         }
-        markParsingResult
-        checkImg()
-        markParsingResult.then(checkImg)
+
+        const currentParsing = markParsingResult
+        let cancelled = false
+
+        currentParsing.then(async () => {
+            await tick()
+            if(!cancelled){
+                checkImg()
+            }
+        })
+
+        return () => {
+            cancelled = true
+        }
     })
 </script>
 
