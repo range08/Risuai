@@ -41,12 +41,18 @@ export async function postInlayAsset(img:{
     const imgObj = new Image()
 
     if(inlayImageExts.includes(extention)){
-        imgObj.src = URL.createObjectURL(new Blob([asBuffer(img.data)], {type: `image/${extention}`}))
+        const objectUrl = URL.createObjectURL(new Blob([asBuffer(img.data)], {type: `image/${extention}`}))
+        imgObj.src = objectUrl
 
-        return await writeInlayImage(imgObj, {
-            name: img.name,
-            ext: extention
-        })
+        try{
+            return await writeInlayImage(imgObj, {
+                name: img.name,
+                ext: extention
+            })
+        }
+        finally{
+            URL.revokeObjectURL(objectUrl)
+        }
     }
 
     if(inlayAudioExts.includes(extention)){
@@ -233,15 +239,21 @@ export async function reencodeImage(img:Uint8Array){
     }
     const canvas = document.createElement('canvas')
     const imgObj = new Image()
-    imgObj.src = URL.createObjectURL(new Blob([asBuffer(img)], {type: `image/png`}))
-    await imgObj.decode()
-    let drawHeight = imgObj.height
-    let drawWidth = imgObj.width
-    canvas.width = drawWidth
-    canvas.height = drawHeight
-    const ctx = canvas.getContext('2d')
-    ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-    const b64 = canvas.toDataURL('image/png').split(',')[1]
-    const b = Buffer.from(b64, 'base64')
-    return b
+    const objectUrl = URL.createObjectURL(new Blob([asBuffer(img)], {type: `image/png`}))
+    imgObj.src = objectUrl
+    try{
+        await imgObj.decode()
+        let drawHeight = imgObj.height
+        let drawWidth = imgObj.width
+        canvas.width = drawWidth
+        canvas.height = drawHeight
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
+        const b64 = canvas.toDataURL('image/png').split(',')[1]
+        const b = Buffer.from(b64, 'base64')
+        return b
+    }
+    finally{
+        URL.revokeObjectURL(objectUrl)
+    }
 }
