@@ -4,7 +4,7 @@
     import { DBState } from 'src/ts/stores.svelte'
     import { sleep } from "src/ts/util"
     import { alertError } from "../../ts/alert"
-    import { addMetadataToElement, getDistance, ParseMarkdown, postTranslationParse, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
+    import { addMetadataToElement, ParseMarkdown, postTranslationParse, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, translateHTML } from "../../ts/translator/translator"
     import { getModuleAssets } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
@@ -66,6 +66,53 @@
     }
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
+
+    // The caller only needs to know whether a candidate is better than maxDistance.
+    // Keep two DP rows and only evaluate the band that can still beat that limit.
+    const getDistanceBelow = (left: string, right: string, maxDistance: number) => {
+        if(left === right){
+            return 0
+        }
+        if(maxDistance <= 0 || Math.abs(left.length - right.length) >= maxDistance){
+            return maxDistance
+        }
+        if(left.length > right.length){
+            [left, right] = [right, left]
+        }
+
+        let previous = new Uint16Array(right.length + 1)
+        let current = new Uint16Array(right.length + 1)
+        for(let j = 0; j <= right.length; j++){
+            previous[j] = Math.min(j, maxDistance)
+        }
+
+        for(let i = 1; i <= left.length; i++){
+            current.fill(maxDistance)
+            if(i < maxDistance){
+                current[0] = i
+            }
+
+            const start = Math.max(1, i - maxDistance + 1)
+            const end = Math.min(right.length, i + maxDistance - 1)
+            let rowMin = maxDistance
+            for(let j = start; j <= end; j++){
+                const distance = Math.min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (left.charCodeAt(i - 1) === right.charCodeAt(j - 1) ? 0 : 1)
+                )
+                current[j] = distance
+                rowMin = Math.min(rowMin, distance)
+            }
+
+            if(rowMin >= maxDistance){
+                return maxDistance
+            }
+            ;[previous, current] = [current, previous]
+        }
+
+        return Math.min(previous[right.length], maxDistance)
+    }
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, requestedRevision: number, tries?:number) => {
         // track 'translated' and 'retranslate' state
@@ -235,7 +282,7 @@
                     if(Math.abs(name.length - asset.name.length) >= currentDistance){
                         continue
                     }
-                    const distance = getDistance(name, asset.name)
+                    const distance = getDistanceBelow(name, asset.name, currentDistance)
                     if(distance < currentDistance){
                         currentDistance = distance
                         currentFound = asset.path
