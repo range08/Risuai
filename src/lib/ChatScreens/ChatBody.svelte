@@ -210,9 +210,14 @@
                 
                 const foundAsset = exactAssets.get(name)
                 if(foundAsset){
+                    const got = await getFileSrc(foundAsset)
+                    const currentName = img.getAttribute('src')?.toLocaleLowerCase() || ''
+                    if(name !== currentName){
+                        return
+                    }
                     img.classList.add('root-loaded-image')
                     img.classList.add('root-loaded-image-' + styl)
-                    img.src = await getFileSrc(foundAsset)
+                    img.src = got
                     return
                 }
 
@@ -228,6 +233,9 @@
                     if(!asset.name.startsWith(prefix)){
                         continue
                     }
+                    if(Math.abs(name.length - asset.name.length) >= currentDistance){
+                        continue
+                    }
                     const distance = getDistance(name, asset.name)
                     if(distance < currentDistance){
                         currentDistance = distance
@@ -239,13 +247,10 @@
                     const name2 = img.getAttribute('src')?.toLocaleLowerCase() || ''
                     if(name === name2){
                         img.setAttribute('src', got)
-                    }
-
-                    if(img.classList.length === 0){
                         img.classList.add('root-loaded-image')
                         img.classList.add('root-loaded-image-' + styl)
+                        img.removeAttribute('noimage')
                     }
-                    img.removeAttribute('noimage')
                 }
                 else{
                     img.setAttribute('noimage', 'true')
