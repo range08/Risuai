@@ -203,17 +203,22 @@ function renderMarkdown(md:markdownit, data:string){
     return text
 }
 
+const highlightPlaceholderRegex = /<pre-hljs-placeholder lang="(.+?)">(.+?)<\/pre-hljs-placeholder>/gms
+
 async function renderHighlightableMarkdown(data:string) {
-    let rendered = renderMarkdown(mdHighlight, data)
-    const highlightPlaceholders = rendered.match(/<pre-hljs-placeholder lang="(.+?)">(.+?)<\/pre-hljs-placeholder>/gms)
-    if (!highlightPlaceholders){
+    const rendered = renderMarkdown(mdHighlight, data)
+    const highlightPlaceholders = Array.from(rendered.matchAll(highlightPlaceholderRegex))
+    if (highlightPlaceholders.length === 0){
         return rendered
     }
 
-    for (const placeholder of highlightPlaceholders){
+    const replacements = new Map<string, string>()
+
+    for (const placeholderMatch of highlightPlaceholders){
         try {
-            let lang = placeholder.match(/lang="(.+?)"/)?.[1]
-            const code = placeholder.match(/<pre-hljs-placeholder lang=".+?">(.+?)<\/pre-hljs-placeholder>/ms)?.[1]
+            const placeholder = placeholderMatch[0]
+            let lang = placeholderMatch[1]
+            const code = placeholderMatch[2]
             if (!lang || !code){
                 continue
             }
@@ -384,24 +389,26 @@ async function renderHighlightableMarkdown(data:string) {
                 hljs.registerLanguage(lang, languageModule.default)
             }
             if(lang === 'none'){
-                rendered = rendered.replace(placeholder, `<pre><code>${md.utils.escapeHtml(code)}</code></pre>`)
+                replacements.set(placeholder, `<pre><code>${md.utils.escapeHtml(code)}</code></pre>`)
             }
             else if(lang === 'error'){
-                rendered = rendered.replace(placeholder, `<div class="risu-error"><h1>${language.error}</h1>${md.utils.escapeHtml(code)}</div>`)
+                replacements.set(placeholder, `<div class="risu-error"><h1>${language.error}</h1>${md.utils.escapeHtml(code)}</div>`)
             }
             else{
                 const highlighted = hljs.highlight(code, {
                     language: lang,
                     ignoreIllegals: true
                 }).value
-                rendered = rendered.replace(placeholder, `<pre class="hljs" x-hl-lang="${fileExt}"><code>${highlighted}</code></pre>`)   
+                replacements.set(placeholder, `<pre class="hljs" x-hl-lang="${fileExt}"><code>${highlighted}</code></pre>`)
             }
         } catch (error) {
             
         }
     }
 
-    return rendered
+    return rendered.replace(highlightPlaceholderRegex, (placeholder) => {
+        return replacements.get(placeholder) ?? placeholder
+    })
 
 }
 
@@ -428,16 +435,36 @@ function getEmoSrc(emoArr: string[][], emoPaths: AssetPaths) {
     }
 }
 
-const fileSrcCache = new Map<string, string>()
+const FILE_SRC_CACHE_LIMIT = 512
+const fileSrcCache = new Map<string, Promise<string>>()
 
 async function getFileSrcCached(path:string){
     let cached = fileSrcCache.get(path)
     if(cached){
+        fileSrcCache.delete(path)
+        fileSrcCache.set(path, cached)
         return cached
     }
-    const src = await getFileSrc(path)
-    fileSrcCache.set(path, src)
-    return src
+
+    const pending = getFileSrc(path)
+    fileSrcCache.set(path, pending)
+    while(fileSrcCache.size > FILE_SRC_CACHE_LIMIT){
+        const oldest = fileSrcCache.keys().next().value as string | undefined
+        if(oldest === undefined){
+            break
+        }
+        fileSrcCache.delete(oldest)
+    }
+
+    try{
+        return await pending
+    }
+    catch(error){
+        if(fileSrcCache.get(path) === pending){
+            fileSrcCache.delete(path)
+        }
+        throw error
+    }
 }
 
 type AssetPaths = {[key:string]:{
@@ -628,40 +655,101 @@ function getClosestMatch(char: simpleCharacterArgument|character, name:string, a
     return assetPaths[closest]
 }
 
-//Levenshtein distance, new with 1d array
+// Exact Levenshtein distance with O(min(a,b)) working memory.
 export function getDistance(a:string, b:string) {
-    const h = a.length + 1
-    const w = b.length + 1
-    let d = new Int16Array(h * w)
-    for(let i=0;i<h;i++){
-        d[i * w] = i
+    if(a === b){
+        return 0
     }
-    for(let i=0;i<w;i++){
-        d[i] = i
+    if(a.length < b.length){
+        [a, b] = [b, a]
     }
-    for(let i=1; i<h; i++){
-        for(let j=1;j<w;j++){
-            d[i * w + j] = Math.min(
-                d[(i-1) * w + j-1] + (a.charAt(i-1)===b.charAt(j-1) ? 0 : 1),
-                d[(i-1) * w + j]+1, d[i * w + j-1]+1
+    if(b.length === 0){
+        return a.length
+    }
+
+    let previous = new Uint32Array(b.length + 1)
+    let current = new Uint32Array(b.length + 1)
+    for(let j = 0; j <= b.length; j++){
+        previous[j] = j
+    }
+
+    for(let i = 1; i <= a.length; i++){
+        current[0] = i
+        for(let j = 1; j <= b.length; j++){
+            current[j] = Math.min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + (a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1)
             )
         }
+        ;[previous, current] = [current, previous]
     }
-    return d[h * w - 1]
+
+    return previous[b.length]
 }
 
+const assetExtensions = ['webp', 'png', 'jpg', 'jpeg', 'gif', 'mp4', 'webm', 'avi', 'm4p', 'm4v', 'mp3', 'wav', 'ogg']
+
 function trimmer(str:string){
-    const ext = ['webp', 'png', 'jpg', 'jpeg', 'gif', 'mp4', 'webm', 'avi', 'm4p', 'm4v', 'mp3', 'wav', 'ogg']
-    for(const e of ext){
+    for(const e of assetExtensions){
         if(str.endsWith('.' + e)){
             str = str.substring(0, str.length - e.length - 1)
+            break
         }
     }
 
     return str.trim().replace(/[_ -.]/g, '')
 }
 
-const blobUrlCache = new Map<string, string>()
+type BlobUrlCacheEntry = {
+    url: string
+    lastUsed: number
+}
+
+const BLOB_URL_CACHE_LIMIT = 128
+const BLOB_URL_MIN_AGE = 60_000
+const blobUrlCache = new Map<string, BlobUrlCacheEntry>()
+let blobUrlCleanupTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleBlobUrlCleanup(){
+    if(blobUrlCache.size <= BLOB_URL_CACHE_LIMIT || blobUrlCleanupTimer !== null){
+        return
+    }
+
+    blobUrlCleanupTimer = setTimeout(() => {
+        blobUrlCleanupTimer = null
+        if(blobUrlCache.size <= BLOB_URL_CACHE_LIMIT){
+            return
+        }
+
+        const activeUrls = new Set<string>()
+        if(typeof document !== 'undefined'){
+            for(const element of document.querySelectorAll('img[src^="blob:"], source[src^="blob:"]')){
+                const src = element.getAttribute('src')
+                if(src){
+                    activeUrls.add(src)
+                }
+            }
+        }
+
+        const now = Date.now()
+        const entries = Array.from(blobUrlCache.entries()).sort((a, b) => a[1].lastUsed - b[1].lastUsed)
+        for(const [id, entry] of entries){
+            if(blobUrlCache.size <= BLOB_URL_CACHE_LIMIT){
+                break
+            }
+            if(activeUrls.has(entry.url) || now - entry.lastUsed < BLOB_URL_MIN_AGE){
+                continue
+            }
+            URL.revokeObjectURL(entry.url)
+            blobUrlCache.delete(id)
+        }
+
+        if(blobUrlCache.size > BLOB_URL_CACHE_LIMIT){
+            scheduleBlobUrlCleanup()
+        }
+    }, BLOB_URL_MIN_AGE)
+}
 
 async function parseInlayAssets(data:string){
     const inlayMatch = data.match(/{{(inlay|inlayed|inlayeddata)::(.+?)}}/g)
@@ -673,10 +761,20 @@ async function parseInlayAssets(data:string){
             let postfix = inlayType !== 'inlay' ? `</div>\n\n` : ''
 
             const asset = await getInlayAssetBlob(id)
-            let url = blobUrlCache.get(id)
+            let cached = blobUrlCache.get(id)
+            let url = cached?.url
+            if(cached){
+                cached.lastUsed = Date.now()
+                blobUrlCache.delete(id)
+                blobUrlCache.set(id, cached)
+            }
             if(!url && asset?.data){
                 url = URL.createObjectURL(asset.data)
-                blobUrlCache.set(id, url)
+                blobUrlCache.set(id, {
+                    url,
+                    lastUsed: Date.now()
+                })
+                scheduleBlobUrlCleanup()
             } 
             switch(asset?.type){
                 case 'image':
@@ -711,24 +809,25 @@ export interface simpleCharacterArgument{
 }
 
 function parseThoughtsAndTools(data:string){
-    let result = '', i = 0
+    const result:string[] = []
+    let i = 0
     while (i < data.length) {
-        if (data.slice(i, i + 10) === '<Thoughts>') {
+        if (data.startsWith('<Thoughts>', i)) {
             let j = i + 10, depth = 1
             while (j < data.length && depth > 0) {
-                if (data.slice(j, j + 10) === '<Thoughts>') depth++
-                if (data.slice(j, j + 11) === '</Thoughts>') depth--
+                if (data.startsWith('<Thoughts>', j)) depth++
+                if (data.startsWith('</Thoughts>', j)) depth--
                 j++
             }
             if (depth === 0) {
-                result += `<details><summary>${language.cot}</summary>${data.substring(i + 10, j - 1)}</details>`
+                result.push(`<details><summary>${language.cot}</summary>${data.substring(i + 10, j - 1)}</details>`)
                 i = j + 10
                 continue
             }
         }
-        result += data[i++]
+        result.push(data[i++])
     }
-    return result.replace(/<tool_call>(.+?)<\/tool_call>/gms, (full, txt:string) => {
+    return result.join('').replace(/<tool_call>(.+?)<\/tool_call>/gms, (full, txt:string) => {
         return `<div class="x-risu-tool-call">🛠️ ${language.toolCalled.replace('{{tool}}',txt.split('\uf100')?.[1] ?? 'unknown')}</div>\n\n`
     })
 }
@@ -839,6 +938,7 @@ const metaCodes = [
     '\u180E', //mongolian vowel separator
 ]
 
+const ENCODED_METADATA_CACHE_LIMIT = 64
 const encodedMetadataCache = new Map<string, string>()
 
 function encodeMetadata(modelShortName:string){
@@ -886,6 +986,12 @@ function encodeMetadata(modelShortName:string){
     }
 
     encodedMetadataCache.set(metadata, encodedMetaCode)
+    if(encodedMetadataCache.size > ENCODED_METADATA_CACHE_LIMIT){
+        const oldest = encodedMetadataCache.keys().next().value as string | undefined
+        if(oldest !== undefined){
+            encodedMetadataCache.delete(oldest)
+        }
+    }
     return encodedMetaCode
 }
 
@@ -895,12 +1001,7 @@ export function addMetadataToElement(data:string, modelShortName:string){
     }
 
     const encodedMetaCode = encodeMetadata(modelShortName)
-    console.log('Encoded metadata:', encodedMetaCode.length, 'characters')
-    console.log('This requires at least', Math.ceil(encodedMetaCode.length / 32), '<p> tags to store')
-
-    let d =  data.replace(/\<p\>/g, (v) => {
-        return '<p>' + encodedMetaCode
-    })
+    const d = data.replace(/\<p\>/g, '<p>' + encodedMetaCode)
 
     return d + encodedMetaCode
 }
@@ -936,22 +1037,21 @@ function encodeStyle(txt:string){
     })
 }
 
+const scopedCssSelectorParser = cssSelectorParser((root) => {
+    root.walkClasses((classes) => {
+        if(classes.type === 'class' && !classes.value.startsWith('x-risu-')){
+            classes.value = 'x-risu-' + classes.value
+        }
+    })
+})
+
 function decodeStyleRule(rule:CssAtRuleAST){
     if(rule.type === 'rule'){
         if(rule.selectors){
             for(let i=0;i<rule.selectors.length;i++){
                 let slt:string = rule.selectors[i]
                 if(slt){
-
-                    const parser = cssSelectorParser((root) => {
-                        root.walkClasses((classes) => {
-                            if(classes.type === 'class' && !classes.value.startsWith('x-risu-')){
-                                classes.value = 'x-risu-' + classes.value
-                            }
-                        })
-                    })
-
-                    slt = parser.processSync(slt)
+                    slt = scopedCssSelectorParser.processSync(slt)
 
                     rule.selectors[i] = ".chattext " + slt
                 }

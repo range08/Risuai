@@ -47,6 +47,19 @@
         }) => void
     }
     let mountInstances: Map<number, ChatInstance> = new Map();
+    let mountedElements: Map<number, HTMLDivElement> = new Map();
+
+    type MessageHashCacheEntry = {
+        data: string
+        chatId: string
+        index: number
+        largePortrait: boolean
+        disabled: string
+        reloadPointer: number
+        ignoreData: boolean
+        hash: number
+    }
+    const messageHashCache = new WeakMap<Message, MessageHashCacheEntry>();
 
     //Non-cryptographic hash function to generate a unique hash for each message
     function hashCode(str:string):number {
@@ -60,6 +73,47 @@
             hash = 1; // Ensure hash is not zero
         }
         return hash;
+    }
+
+    function getMessageHash(
+        message: Message,
+        index: number,
+        largePortrait: boolean,
+        reloadPointer: number,
+        ignoreData: boolean,
+    ){
+        const data = ignoreData ? '' : message.data
+        const chatId = message.chatId ?? ''
+        const disabled = message.disabled?.toString() ?? ''
+        const cached = messageHashCache.get(message)
+
+        if(
+            cached &&
+            cached.data === data &&
+            cached.chatId === chatId &&
+            cached.index === index &&
+            cached.largePortrait === largePortrait &&
+            cached.disabled === disabled &&
+            cached.reloadPointer === reloadPointer &&
+            cached.ignoreData === ignoreData
+        ){
+            return cached.hash
+        }
+
+        const hash = hashCode(
+            data + chatId + index.toString() + largePortrait.toString() + disabled + reloadPointer.toString()
+        )
+        messageHashCache.set(message, {
+            data,
+            chatId,
+            index,
+            largePortrait,
+            disabled,
+            reloadPointer,
+            ignoreData,
+            hash,
+        })
+        return hash
     }
 
     const updateChatBody = () => {
@@ -96,9 +150,7 @@
             const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false);
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const activeStreamingMessage = i === activeStreamingIndex && message.role === 'char';
-            const hashMessageData = activeStreamingMessage ? '' : message.data;
-            let hashd = hashMessageData + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString();
-            const currentHash = hashCode(hashd);
+            const currentHash = getMessageHash(message, i, messageLargePortrait, reloadPointer, activeStreamingMessage);
             currentHashes.add(currentHash);
             if(!hashes.has(currentHash)){
                 const b = document.createElement('div');
@@ -129,9 +181,10 @@
 
                 })
                 mountInstances.set(currentHash, inst);
-                const nextElement = nextHash === 0 ? null : chatBody.querySelector(`[x-hashed="${nextHash}"]`);
+                mountedElements.set(currentHash, b);
+                const nextElement = nextHash === 0 ? null : mountedElements.get(nextHash);
                 if(nextElement){
-                    chatBody.insertBefore(b, nextElement?.nextSibling);
+                    chatBody.insertBefore(b, nextElement.nextSibling);
                 }
                 else{
                     chatBody.prepend(b);
@@ -148,31 +201,33 @@
             
         }
 
-        //@ts-expect-error Set<T> requires type arg, and Set.difference needs 'esnext' lib (polyfilled by Core-js)
-        const toRemove:Set = hashes.difference(currentHashes);
-        toRemove.forEach((hash) => {
+        for(const hash of hashes){
+            if(currentHashes.has(hash)){
+                continue
+            }
             const inst = mountInstances.get(hash);
             if(inst){
                 unmount(inst);
                 mountInstances.delete(hash);
             }
-            const element = chatBody.querySelector(`[x-hashed="${hash}"]`);
+            const element = mountedElements.get(hash);
             if(element){
-                chatBody.removeChild(element);
+                element.remove();
+                mountedElements.delete(hash);
             }
-        });
+        }
 
         hashes = currentHashes;
         
     };
 
     onDestroy(() => {
-        console.log('Unmounting Chats');
         hashes.clear();
         mountInstances.forEach((inst) => {
             unmount(inst);
         });
         mountInstances.clear();
+        mountedElements.clear();
     })
 
     function checkIfAtBottom() {
@@ -198,7 +253,6 @@
     let previousChatRoomId: string | null = null;
 
     $effect(() => {
-        console.log('Updating Chats');
         void $ReloadChatPointer; // Make $effect track ReloadChatPointer changes
         const wasAtBottom = checkIfAtBottom();
         updateChatBody()

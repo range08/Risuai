@@ -1,9 +1,10 @@
 <script lang="ts">
     import isEqual from "lodash/isEqual"
+    import { tick } from "svelte"
     import { DBState } from 'src/ts/stores.svelte'
     import { sleep } from "src/ts/util"
     import { alertError } from "../../ts/alert"
-    import { addMetadataToElement, getDistance, ParseMarkdown, postTranslationParse, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
+    import { addMetadataToElement, ParseMarkdown, postTranslationParse, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, translateHTML } from "../../ts/translator/translator"
     import { getModuleAssets } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
@@ -30,7 +31,7 @@
         character = null,
         idx = 0,
         firstMessage = false,
-        msgDisplay,
+        msgDisplay = '',
         role,
         translated = $bindable(false),
         translating = $bindable(false),
@@ -65,6 +66,53 @@
     }
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
+
+    // The caller only needs to know whether a candidate is better than maxDistance.
+    // Keep two DP rows and only evaluate the band that can still beat that limit.
+    const getDistanceBelow = (left: string, right: string, maxDistance: number) => {
+        if(left === right){
+            return 0
+        }
+        if(maxDistance <= 0 || Math.abs(left.length - right.length) >= maxDistance){
+            return maxDistance
+        }
+        if(left.length > right.length){
+            [left, right] = [right, left]
+        }
+
+        let previous = new Uint16Array(right.length + 1)
+        let current = new Uint16Array(right.length + 1)
+        for(let j = 0; j <= right.length; j++){
+            previous[j] = Math.min(j, maxDistance)
+        }
+
+        for(let i = 1; i <= left.length; i++){
+            current.fill(maxDistance)
+            if(i < maxDistance){
+                current[0] = i
+            }
+
+            const start = Math.max(1, i - maxDistance + 1)
+            const end = Math.min(right.length, i + maxDistance - 1)
+            let rowMin = maxDistance
+            for(let j = start; j <= end; j++){
+                const distance = Math.min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (left.charCodeAt(i - 1) === right.charCodeAt(j - 1) ? 0 : 1)
+                )
+                current[j] = distance
+                rowMin = Math.min(rowMin, distance)
+            }
+
+            if(rowMin >= maxDistance){
+                return maxDistance
+            }
+            ;[previous, current] = [current, previous]
+        }
+
+        return Math.min(previous[right.length], maxDistance)
+    }
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, requestedRevision: number, tries?:number) => {
         // track 'translated' and 'retranslate' state
@@ -195,32 +243,34 @@
                 }
             })
             const exactAssets = new Map(normalizedAssets.map((asset) => [asset.name, asset.path]))
+            const resolvedAssetPaths = new Map<string, string | null>()
+            const fileSrcPromises = new Map<string, Promise<string>>()
 
-            imgs.forEach(async (img) => {
-                const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
-                console.log(name)
-
-                if(
-                    name.length > 200 ||
-                    name.includes(':')
-                ){
-                    img.setAttribute('noimage', 'true')
-                    return
+            const getFileSrcOnce = (path: string) => {
+                let pending = fileSrcPromises.get(path)
+                if(!pending){
+                    pending = getFileSrc(path)
+                    fileSrcPromises.set(path, pending)
                 }
-                
-                const foundAsset = exactAssets.get(name)
-                console.log('Checking image:', name, 'Assets:', assets)
-                if(foundAsset){
-                    img.classList.add('root-loaded-image')
-                    img.classList.add('root-loaded-image-' + styl)
-                    img.src = await getFileSrc(foundAsset)
-                    return
+                return pending
+            }
+
+            const findAssetPath = (name: string) => {
+                if(resolvedAssetPaths.has(name)){
+                    return resolvedAssetPaths.get(name) ?? null
+                }
+
+                const exact = exactAssets.get(name)
+                if(exact){
+                    resolvedAssetPaths.set(name, exact)
+                    return exact
                 }
 
                 if(name.length < 3){
-                    img.setAttribute('noimage', 'true')
-                    return
+                    resolvedAssetPaths.set(name, null)
+                    return null
                 }
+
                 const prefixLoc = name.lastIndexOf('.')
                 const prefix = prefixLoc > 0 ? name.substring(0, prefixLoc) : ''
                 let currentDistance = 1000
@@ -229,41 +279,72 @@
                     if(!asset.name.startsWith(prefix)){
                         continue
                     }
-                    const distance = getDistance(name, asset.name)
+                    if(Math.abs(name.length - asset.name.length) >= currentDistance){
+                        continue
+                    }
+                    const distance = getDistanceBelow(name, asset.name, currentDistance)
                     if(distance < currentDistance){
                         currentDistance = distance
                         currentFound = asset.path
                     }
                 }
-                if(currentFound){
-                    const got = await getFileSrc(currentFound)
-                    const name2 = img.getAttribute('src')?.toLocaleLowerCase() || ''
-                    if(name === name2){
-                        img.setAttribute('src', got)
-                    }
 
-                    if(img.classList.length === 0){
-                        img.classList.add('root-loaded-image')
-                        img.classList.add('root-loaded-image-' + styl)
-                    }
-                    img.removeAttribute('noimage')
-                }
-                else{
+                const resolved = currentFound || null
+                resolvedAssetPaths.set(name, resolved)
+                return resolved
+            }
+
+            imgs.forEach(async (img) => {
+                const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
+
+                if(
+                    name.length > 200 ||
+                    name.includes(':')
+                ){
                     img.setAttribute('noimage', 'true')
+                    return
                 }
+
+                const foundAsset = findAssetPath(name)
+                if(!foundAsset){
+                    img.setAttribute('noimage', 'true')
+                    return
+                }
+
+                const got = await getFileSrcOnce(foundAsset)
+                const currentName = img.getAttribute('src')?.toLocaleLowerCase() || ''
+                if(name !== currentName){
+                    return
+                }
+
+                img.setAttribute('src', got)
+                img.classList.add('root-loaded-image')
+                img.classList.add('root-loaded-image-' + styl)
+                img.removeAttribute('noimage')
             })
         }
     }
 
-    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character, idx, renderRevision))
+    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character ?? '', idx, renderRevision))
 
     $effect(() => {
         if(shouldRenderRawStreaming){
             return
         }
-        markParsingResult
-        checkImg()
-        markParsingResult.then(checkImg)
+
+        const currentParsing = markParsingResult
+        let cancelled = false
+
+        currentParsing.then(async () => {
+            await tick()
+            if(!cancelled){
+                checkImg()
+            }
+        })
+
+        return () => {
+            cancelled = true
+        }
     })
 </script>
 

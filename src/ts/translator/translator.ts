@@ -19,12 +19,53 @@ import { processScriptFull } from "../process/scripts"
 import localforage from "localforage"
 import sendSound from '../../etc/send.mp3'
 
-let cache={
-    origin: [''],
-    trans: ['']
+const TRANSLATION_CACHE_LIMIT = 512
+const translationCache = new Map<string, string>()
+const translationInFlight = new Map<string, Promise<string>>()
+
+function getTranslationCacheKey(text:string, from:string, to:string, translatorNote?:string){
+    const db = getDatabase()
+    return [
+        db.translatorType,
+        db.aiModel,
+        db.translatorInputLanguage,
+        db.useExperimentalGoogleTranslator ? '1' : '0',
+        db.deeplOptions?.freeApi ? '1' : '0',
+        db.deeplXOptions?.url ?? '',
+        from,
+        to,
+        translatorNote ?? '',
+        text,
+    ].join('\u0000')
+}
+
+function getCachedTranslation(key:string){
+    const cached = translationCache.get(key)
+    if(cached === undefined){
+        return undefined
+    }
+
+    // Refresh insertion order so frequently used translations stay cached.
+    translationCache.delete(key)
+    translationCache.set(key, cached)
+    return cached
+}
+
+function setCachedTranslation(key:string, value:string){
+    translationCache.delete(key)
+    translationCache.set(key, value)
+
+    while(translationCache.size > TRANSLATION_CACHE_LIMIT){
+        const oldest = translationCache.keys().next().value as string | undefined
+        if(oldest === undefined){
+            break
+        }
+        translationCache.delete(oldest)
+    }
 }
 
 let bergamotTranslate: (text: string, from: string, to: string, html?: boolean) => Promise<string>|null = null
+let translateEndAudio: HTMLAudioElement | null = null
 
 export const LLMCacheStorage = localforage.createInstance({
     name: "LLMTranslateCache"
@@ -37,20 +78,7 @@ export function getCurrentTranslatorPreset(): TranslatorPreset {
 }
 
 export async function translate(text:string, reverse:boolean) {
-    let db = getDatabase()
-    if(!reverse){
-        const ind = cache.origin.indexOf(text)
-        if(ind !== -1){
-            return cache.trans[ind]
-        }
-    }
-    else{
-        const ind = cache.trans.indexOf(text)
-        if(ind !== -1){
-            return cache.origin[ind]
-        }
-    }
-
+    const db = getDatabase()
     return runTranslator(text, reverse, db.translator,db.aiModel.startsWith('novellist') ? 'ja' : 'en')
 }
 
@@ -65,57 +93,81 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
         translatorNote: exarg?.translatorNote
     }
-    const texts = text.split('\n')
-    let chunks:[string,boolean][] = [['', true]]
 
-    for(let i = 0; i < texts.length; i++){
-        if( texts[i].startsWith('{{img')
-            || texts[i].startsWith('{{raw')
-            || texts[i].startsWith('{{video')
-            || texts[i].startsWith('{{audio')
-            && texts[i].endsWith('}}')
-            || texts[i].length === 0){
-            chunks.push([texts[i], false])
-            chunks.push(["", true])
-        }
-        else{
-            chunks[chunks.length-1][0] += texts[i]
-        }
+    const cacheKey = getTranslationCacheKey(text, arg.from, arg.to, arg.translatorNote)
+    const cached = getCachedTranslation(cacheKey)
+    if(cached !== undefined){
+        return cached
     }
 
-    let fullResult:string[] = []
+    const inFlight = translationInFlight.get(cacheKey)
+    if(inFlight){
+        return inFlight
+    }
 
-    for(const chunk of chunks){
-        if(chunk[1]){
-            const trimed = chunk[0].trim();
-            if(trimed.length === 0){
+    const pending = (async () => {
+        const texts = text.split('\n')
+        let chunks:[string,boolean][] = [['', true]]
+
+        for(let i = 0; i < texts.length; i++){
+            if( texts[i].startsWith('{{img')
+                || texts[i].startsWith('{{raw')
+                || texts[i].startsWith('{{video')
+                || texts[i].startsWith('{{audio')
+                && texts[i].endsWith('}}')
+                || texts[i].length === 0){
+                chunks.push([texts[i], false])
+                chunks.push(["", true])
+            }
+            else{
+                chunks[chunks.length-1][0] += texts[i]
+            }
+        }
+
+        let fullResult:string[] = []
+
+        for(const chunk of chunks){
+            if(chunk[1]){
+                const trimed = chunk[0].trim();
+                if(trimed.length === 0){
+                    fullResult.push(chunk[0])
+                    continue
+                }
+                const result = await translateMain(trimed, arg);
+
+                if(result.startsWith('ERR::')){
+                    alertError(result)
+                    return text
+                }
+
+
+                fullResult.push(result.trim())
+            }
+            else{
                 fullResult.push(chunk[0])
-                continue
             }
-            const result = await translateMain(trimed, arg);
-
-            if(result.startsWith('ERR::')){
-                alertError(result)
-                return text
-            }
-
-
-            fullResult.push(result.trim())
         }
-        else{
-            fullResult.push(chunk[0])
+
+        const result = fullResult.join("\n").trim()
+
+        setCachedTranslation(cacheKey, result)
+        setCachedTranslation(
+            getTranslationCacheKey(result, arg.to, arg.from, arg.translatorNote),
+            text
+        )
+
+        return result
+    })()
+
+    translationInFlight.set(cacheKey, pending)
+    try{
+        return await pending
+    }
+    finally{
+        if(translationInFlight.get(cacheKey) === pending){
+            translationInFlight.delete(cacheKey)
         }
     }
-
-    const result = fullResult.join("\n").trim()
-
-    cache.origin.push(reverse ? result : text)
-        
-    cache.trans.push(reverse ? text : result)
-
-
-    return result
-
 }
 
 async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}){
@@ -278,6 +330,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
         }
     }
     let db = getDatabase()
+    const superChunkedTranslate = db.translatorType === 'deeplX'
     let DoingChat = get(doingChat)
     if(DoingChat){
         if(isExpTranslator()){
@@ -291,8 +344,9 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
         const from = db.translatorInputLanguage
         const r = await translateLLM(html, {to: tr, from: from, regenerate})
         if(db.playMessageOnTranslateEnd){
-            const audio = new Audio(sendSound);
-            audio.play().catch(() => {});
+            translateEndAudio ??= new Audio(sendSound)
+            translateEndAudio.currentTime = 0
+            translateEndAudio.play().catch(() => {});
         }
 
         return applyEdittransRegex(r, charArg, alwaysExistChar, chatID)
@@ -309,7 +363,6 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
         return applyEdittransRegex(await bergamotTranslate(html, from, to, true), charArg, alwaysExistChar, chatID)
     }
     const dom = new DOMParser().parseFromString(html, 'text/html');
-    console.log(html)
 
     let promises: Promise<void>[] = [];
     let translationChunks: {
@@ -322,7 +375,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     
 
     async function translateTranslationChunks(force:boolean = false, additionalChunkLength = 0){
-        if(translationChunks.length === 0 || !needSuperChunkedTranslate()){
+        if(translationChunks.length === 0 || !superChunkedTranslate){
             return
         }
 
@@ -346,19 +399,19 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
 
         const split = translated.split('■')
 
-        console.log(split.length, currentChunk.chunks.length)
-
         if(split.length !== currentChunk.chunks.length){
-            //try translating one by one
+            // If the delimiter did not survive translation, fall back to the
+            // original chunks in parallel instead of retrying them serially.
+            const fallback = await Promise.all(
+                currentChunk.chunks.map((chunk) => translate(chunk, reverse))
+            )
             for(let i = 0; i < currentChunk.chunks.length; i++){
-                currentChunk.resolvers[i](
-                    await translate(currentChunk.chunks[i]
-                , reverse))
+                currentChunk.resolvers[i](fallback[i])
             }
+            return
         }
         
         for(let i = 0; i < split.length; i++){
-            console.log(split[i])
             currentChunk.resolvers[i](split[i])
         }
 
@@ -367,7 +420,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
 
     async function translateNodeText(node:Node, reprocessDisplayScript:boolean = false) {
         if(node.textContent.trim().length !== 0){
-            if(needSuperChunkedTranslate()){
+            if(superChunkedTranslate){
                 const prm = new Promise<string>((resolve) => {
                     translateTranslationChunks(false, node.textContent.length)
                     translationChunks[translationChunks.length-1].resolvers.push(resolve)
@@ -379,13 +432,9 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             }
 
             const translateChunks = (node.textContent || '').split(/\n\n+/g);
-            let translatedChunksPromises: Promise<string>[] = [];
-            for (const chunk of translateChunks) {
-                const translatedPromise = translate(chunk, reverse);
-                translatedChunksPromises.push(translatedPromise);
-            }
-
-            const translatedChunks = await Promise.all(translatedChunksPromises);
+            const translatedChunks = await Promise.all(
+                translateChunks.map((chunk) => translate(chunk, reverse))
+            );
             let translated = translatedChunks.join("\n\n");
             if (!reprocessDisplayScript) {
                 node.textContent = translated;
@@ -500,10 +549,6 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     return translatedHTML
 }
 
-function needSuperChunkedTranslate(){
-    return getDatabase().translatorType === 'deeplX'
-}
-
 async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(text)
@@ -522,7 +567,6 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
     const charIndex = get(selectedCharID)
     const currentChar = db.characters[charIndex]
     let translatorNote = ""
-    console.log(arg.translatorNote)
     if(arg.translatorNote){
         translatorNote = arg.translatorNote
     }
@@ -531,7 +575,6 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
     } else {
         translatorNote = ""
     }
-    console.log(translatorNote)
 
     let formated:OpenAIChat[] = []
     const preset = getCurrentTranslatorPreset()
